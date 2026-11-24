@@ -1,0 +1,438 @@
+name: sync-upstream-build-release
+
+# 上游 horizon-rust/horizon 一有更新，就合进本 fork 的 main，随即在原生 ARM64 runner 上编出
+# 四个官方二进制（horizon-client / horizon-ctl / horizon-prepare / horizon-server）加
+# horizon-wasm-std.wasm，打成 tar.gz 发到 Release（滚动 tag linux-aarch64-local），供本机镜像站下载。
+#
+# 为什么用 cron 而不是"上游推送事件"：上游不在本仓库里，GitHub 没有跨仓库的 push 事件。
+# 轮询 + `git merge-base --is-ancestor` 判断，幂等且便宜（无更新时整个 run 十几秒）。
+#
+# 首次使用：fork 仓库的定时工作流默认关闭，需要在 Actions 页面点一次 "Enable workflow"，
+# 或先手动 Dispatch 一次。
+#
+# 注意：本 workflow 跑在 GitHub runner 上（境外直连），不使用本机的镜像站配置——
+# 镜像只对校园网有价值，runner 上加了反而更慢。
+
+on:
+  schedule:
+    # 每 6 小时查一次上游（UTC 17 分，避开整点高峰）
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 上游没变也强制重编一遍
+        type: boolean
+        default: false
+      reset_to_upstream:
+        description: 危险：把 fork main 硬重置到上游（丢弃本 fork 的 CI 提交）
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [upstream-update]
+
+# 同一时间只跑一个实例，避免两个构建抢同一个 Release
+concurrency:
+  group: sync-upstream-build-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 推送同步提交 + 建 Release
+  actions: read
+
+env:
+  UPSTREAM_REPO: horizon-rust/horizon
+  FORK_BRANCH: main
+  RELEASE_TAG: linux-aarch64-local
+  ASSET_TARBALL: horizon-linux-aarch64-official.tar.gz
+
+jobs:
+  # ───────────────────────────────────────────────────────────
+  # 1. 比对上游，有更新就合并进 fork main 并推送
+  # ───────────────────────────────────────────────────────────
+  sync:
+    name: sync upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      sha: ${{ steps.decide.outputs.sha }}
+      upstream_sha: ${{ steps.decide.outputs.upstream_sha }}
+      version: ${{ steps.decide.outputs.version }}
+      nightly: ${{ steps.decide.outputs.nightly }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true   # 后面要 push，用 GITHUB_TOKEN
+
+      - name: 配置身份与上游远端
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}"
+
+      - name: 取上游与本地
+        run: |
+          set -euo pipefail
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin "${FORK_BRANCH}"
+
+      - name: 硬重置到上游（仅手动勾选时）
+        if: inputs.reset_to_upstream
+        run: |
+          echo "::warning::reset_to_upstream=true，fork main 将硬重置到上游并强推"
+          git reset --hard upstream/main
+
+      - name: 合并上游
+        id: merge
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "上游已在 fork main 中，无需合并"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "上游有新提交：$(git rev-list --count HEAD..upstream/main) 个，开始合并"
+          if git merge --no-ff --no-edit upstream/main \
+               -m "chore: sync upstream $(git rev-parse --short=8 upstream/main) [skip ci]"; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::合并上游冲突，冲突文件："
+            git diff --name-only --diff-filter=U | sed 's/^/  /'
+            git merge --abort
+            echo "::error::请在本地解决后重跑；若只想跟随上游，可手动 Dispatch 并勾选 reset_to_upstream。"
+            exit 1
+          fi
+
+      - name: 推送
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.reset_to_upstream }}" = "true" ]; then
+            git push --force-with-lease origin "HEAD:${FORK_BRANCH}"
+          else
+            git push origin "HEAD:${FORK_BRANCH}"
+          fi
+
+      - name: 决定是否构建
+        id: decide
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse upstream/main)"
+          if [ "${{ steps.merge.outputs.merged }}" = "true" ] || [ "${{ inputs.force }}" = "true" ]; then
+            build=true
+          else
+            build=false
+          fi
+          # 版本口径照上游 nightly：HORIZON_VERSION 进 --version 与 user agent（必须与
+          # `horizon-prepare --version` 的输出严格相等，见下面校验），
+          # HORIZON_NIGHTLY 是游戏里显示的 "<日期> <短 sha>"。
+          version="nightly-$(date -u +%Y%m%d)"
+          nightly="$(date -u +%Y-%m-%d) $(printf '%s' "$sha" | cut -c1-7)"
+          {
+            echo "build=$build"
+            echo "sha=$sha"
+            echo "upstream_sha=$upstream_sha"
+            echo "version=$version"
+            echo "nightly=$nightly"
+          } >> "$GITHUB_OUTPUT"
+          echo "build=$build  sha=${sha:0:8}  version=$version  nightly=$nightly"
+
+      - name: 摘要
+        run: |
+          {
+            echo "### 同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 HEAD | \`${{ steps.decide.outputs.upstream_sha }}\` |"
+            echo "| fork HEAD | \`${{ steps.decide.outputs.sha }}\` |"
+            echo "| 是否构建 | **${{ steps.decide.outputs.build }}** |"
+            echo "| 版本号 | \`${{ steps.decide.outputs.version }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────
+  # 2. 原生 ARM64 构建（口径照上游 .github/workflows/game-build.yml）
+  # ───────────────────────────────────────────────────────────
+  build:
+    name: build linux-aarch64
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      HORIZON_VERSION: ${{ needs.sync.outputs.version }}
+      HORIZON_NIGHTLY: ${{ needs.sync.outputs.nightly }}
+      CARGO_NET_RETRY: '10'
+      CARGO_HTTP_TIMEOUT: '120'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          clean: true
+
+      - name: 构建机信息 / 腾磁盘
+        run: |
+          uname -a
+          echo "cores=$(nproc)"; free -h; df -h /
+          # wgpu + wasmtime 的 release 产物很大，先清掉镜像里用不上的大件
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/az \
+                      /usr/local/share/boost /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 读上游钉的 rust 版本
+        id: rust
+        run: |
+          if [ -f tools/ci/rust-version ]; then
+            v="$(tr -d '[:space:]' < tools/ci/rust-version)"
+          else
+            v="stable"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "用 rust $v"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          components: rust-src
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: aarch64-official
+          save-if: 'true'
+
+      - name: 系统依赖（ALSA / udev / pkg-config）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev pkg-config
+          rustc -vV
+
+      - name: 构建四个官方二进制
+        run: |
+          cargo build --release --locked \
+            -p horizon-official    --bin horizon-official \
+            -p horizon-client-lib  --bin horizon-ctl \
+            -p horizon-prepare     --bin horizon-prepare \
+            -p horizon-server      --bin horizon-server
+
+      - name: horizon-official 就是玩家拿到的 horizon-client
+        run: cp -f target/release/horizon-official target/release/horizon-client
+
+      - name: 构建 mod 共用的 wasm 标准库
+        run: |
+          mkdir -p wasm-std
+          cargo run --locked -p cargo-horizon-mod -- \
+            wasm-std wasm-std/horizon-wasm-std.wasm
+          ls -l wasm-std/
+
+      - name: 归集
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for f in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            test -f "target/release/$f" || { echo "::error::缺 target/release/$f"; exit 1; }
+            cp -f "target/release/$f" dist/
+          done
+          cp -f wasm-std/horizon-wasm-std.wasm dist/
+          chmod +x dist/horizon-*
+          file dist/*
+          du -sh dist
+
+      - name: 依赖检查（只链系统库）
+        # 上游 tools/check_imports.py 把 glibc loader 硬编码成 x86_64 的
+        # /lib64/ld-linux-x86-64.so.2，在 aarch64 上会全线误报，所以按同样的口径自己判。
+        run: |
+          set -euo pipefail
+          allowed_loader='/lib/ld-linux-aarch64.so.1'
+          allowed_libs='libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1
+                        libgcc_s.so.1 libstdc++.so.6 libasound.so.2 libudev.so.1
+                        ld-linux-aarch64.so.1'
+          fail=0
+          for f in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            echo "== $f =="
+            bin="dist/$f"
+            loader="$(readelf -l "$bin" | sed -n 's|.*interpreter: \(.*\)\]|\1|p')"
+            echo "  loader: $loader"
+            if [ "$loader" != "$allowed_loader" ]; then
+              echo "::error::$f 的 loader 是 $loader，不是 $allowed_loader"; fail=1
+            fi
+            while read -r lib; do
+              [ -n "$lib" ] || continue
+              case " $(echo $allowed_libs) " in
+                *" $lib "*) echo "  ok  $lib" ;;
+                *) echo "::error::$f 依赖 $lib，不是每个发行版都有"; fail=1 ;;
+              esac
+            done < <(ldd "$bin" | awk '/=>/ {print $1}')
+          done
+          [ "$fail" = 0 ] || exit 1
+          echo "依赖检查通过：只链系统库"
+
+      - name: 每个程序都能起来，版本是这次的
+        run: |
+          set -euo pipefail
+          dist/horizon-client  --help | grep -q -- '--resources'
+          dist/horizon-ctl     --help > /dev/null
+          dist/horizon-prepare --help | grep -q -- '--minecraft-dir'
+          dist/horizon-server  --help > /dev/null
+          for b in horizon-prepare horizon-server; do
+            out="$(dist/$b --version | tr -d '\r')"
+            echo "$out"
+            if [ "$out" != "$b $HORIZON_VERSION" ]; then
+              echo "::error::期望 '$b $HORIZON_VERSION'，得到 '$out'"; exit 1
+            fi
+          done
+          echo "四个程序都能启动，版本已带上"
+
+      - name: 构建溯源
+        run: |
+          {
+            echo "Horizon Linux aarch64 official build"
+            echo "built_at      : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "version       : $HORIZON_VERSION"
+            echo "nightly       : $HORIZON_NIGHTLY"
+            echo "upstream_repo : $UPSTREAM_REPO"
+            echo "upstream_sha  : ${{ needs.sync.outputs.upstream_sha }}"
+            echo "built_sha     : ${{ needs.sync.outputs.sha }}"
+            echo "runner        : ${{ runner.os }} / ${{ runner.arch }} / ubuntu-24.04-arm"
+            echo "rustc         : $(rustc -V)"
+            echo "cargo         : $(cargo -V)"
+            echo "host          : $(rustc -vV | sed -n 's/^host: //p')"
+          } > dist/BUILD-INFO.txt
+          cat dist/BUILD-INFO.txt
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          tar -czf "${ASSET_TARBALL}" -C dist .
+          sha256sum "${ASSET_TARBALL}" > SHA256SUMS
+          tar -tzf "${ASSET_TARBALL}"
+          cat SHA256SUMS
+          ls -lh "${ASSET_TARBALL}" SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-linux-aarch64-official
+          path: |
+            ${{ env.ASSET_TARBALL }}
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────
+  # 3. 发布到 Release（滚动 tag，镜像站按固定 URL 拉）
+  # ───────────────────────────────────────────────────────────
+  release:
+    name: publish release
+    needs: [sync, build]
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: horizon-linux-aarch64-official
+          path: dist
+
+      - name: 校验校验和
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -c SHA256SUMS
+          ls -lh
+
+      - name: 写 Release 说明
+        run: |
+          {
+            echo "# Horizon Linux aarch64（本地构建）"
+            echo ""
+            echo 'GitHub Actions `ubuntu-24.04-arm` 原生 ARM64 构建，口径照上游 `.github/workflows/game-build.yml`。'
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 版本 | \`${{ needs.sync.outputs.version }}\` |"
+            echo "| 上游 | \`${{ needs.sync.outputs.upstream_sha }}\` |"
+            echo "| 构建于 | \`${{ needs.sync.outputs.sha }}\` |"
+            echo "| 时间 | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+            echo ""
+            echo "## 包含"
+            echo ""
+            echo "- \`horizon-client\` — 游戏本体（由 \`horizon-official\` 改名）"
+            echo "- \`horizon-ctl\` — 命令行 / MCP 控制"
+            echo "- \`horizon-prepare\` — 从你自己的 Minecraft 提取资源"
+            echo "- \`horizon-server\` — 专用服务端"
+            echo "- \`horizon-wasm-std.wasm\` — mod 运行时共用的 wasm 标准库"
+            echo "- \`BUILD-INFO.txt\` — 构建溯源"
+            echo ""
+            echo "不含任何 Minecraft 文件，资源由玩家自己的游戏副本生成。"
+            echo ""
+            echo "## 用法"
+            echo ""
+            echo '```bash'
+            echo "tar -xzf ${ASSET_TARBALL}"
+            echo "sha256sum -c SHA256SUMS"
+            echo ""
+            echo "# 从你自己的 26.3 实例提取资源（需要该版本的 server jar）"
+            echo "./horizon-prepare --prepare --minecraft-dir ~/.minecraft \\"
+            echo "  --output ./resources --server-jar ./server-26.3.jar --complete"
+            echo ""
+            echo "./horizon-client --resources ./resources --game-dir ~/.minecraft"
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: 建 / 更新 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} 已存在，替换资产"
+            gh release upload "${RELEASE_TAG}" \
+              "dist/${ASSET_TARBALL}" dist/SHA256SUMS --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --title "Horizon Linux aarch64 本地构建产物" \
+              --notes-file notes.md
+          else
+            echo "创建 Release ${RELEASE_TAG}"
+            gh release create "${RELEASE_TAG}" \
+              "dist/${ASSET_TARBALL}" dist/SHA256SUMS \
+              --target "${{ needs.sync.outputs.sha }}" \
+              --title "Horizon Linux aarch64 本地构建产物" \
+              --notes-file notes.md
+          fi
+
+      - name: 摘要
+        run: |
+          {
+            echo "### 已发布"
+            echo ""
+            echo "- tag: \`${RELEASE_TAG}\`"
+            echo "- 版本: \`${{ needs.sync.outputs.version }}\`"
+            echo "- 上游: \`${{ needs.sync.outputs.upstream_sha }}\`"
+            echo "- 构建于: \`${{ needs.sync.outputs.sha }}\`"
+            echo ""
+            echo "本机镜像下载（路径键 T 见 \`配置-config/linux/04-网络与代理.md\`）："
+            echo '```'
+            echo "https://qianfeng-gh.kdns.fr/<T>/https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/${ASSET_TARBALL}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
