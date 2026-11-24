@@ -1,0 +1,87 @@
+name: build linux aarch64
+
+on:
+  workflow_dispatch:
+    inputs:
+      server:
+        description: "1 = 只构建专用服务端版本"
+        default: "0"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: linux-aarch64 (native arm runner)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: 构建机信息
+        run: |
+          uname -a
+          echo "cores=$(nproc)"
+          free -h
+          df -h /
+          ldd --version | head -1
+
+      - id: rust
+        name: 读上游钉住的书链版本
+        run: echo "version=$(cat tools/ci/rust-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 系统依赖（ALSA / udev / pkg-config）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev pkg-config
+
+      - name: 编译器宿主校验
+        run: |
+          rustc -vV
+          python3 -V
+
+      - name: 构建（上游 prebuilt_game.py，本机原生 aarch64）
+        env:
+          CARGO_NET_RETRY: '10'
+          CARGO_HTTP_TIMEOUT: '120'
+        run: |
+          if [ "${{ github.event.inputs.server }}" = "1" ]; then
+            python3 tools/prebuilt_game.py build prebuilt --server
+          else
+            python3 tools/prebuilt_game.py build prebuilt
+          fi
+
+      - name: 产物清单
+        run: |
+          du -sh prebuilt || true
+          find prebuilt -maxdepth 1 -printf '%y %10s %p\n' | sort -k3 | head -40
+          find prebuilt -type f -name 'horizon*' -maxdepth 2 -printf '%10s %p\n' | head -20
+
+      - name: 打包 artifact
+        run: |
+          tar -C prebuilt -cJf horizon-linux-aarch64.tar.xz . 2>/dev/null || tar -C prebuilt -cJf horizon-linux-aarch64.tar.xz .
+          ls -lh horizon-linux-aarch64.tar.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-linux-aarch64
+          path: horizon-linux-aarch64.tar.xz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
