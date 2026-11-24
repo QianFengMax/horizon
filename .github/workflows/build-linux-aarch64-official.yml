@@ -1,0 +1,95 @@
+name: build linux aarch64 official
+
+# 与上游 game-build.yml 的 release 口径一致：horizon-official（即 horizon-client 本体）、
+# horizon-ctl、horizon-prepare、horizon-server 四个二进制的静态 release 构建，
+# 外加 mod 运行时共用的 horizon-wasm-std.wasm。原生 arm64 runner 上编，产物直接给本机用。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official:
+    name: linux-aarch64 official binaries
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: 构建机信息
+        run: |
+          uname -a
+          echo "cores=$(nproc)"
+          free -h
+          df -h /
+          ldd --version | head -1
+
+      - id: rust
+        run: echo "version=$(cat tools/ci/rust-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          components: rust-src
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 系统依赖（ALSA / udev）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev pkg-config
+
+      - name: 编译器宿主校验
+        run: rustc -vV
+
+      - name: 构建四个官方二进制
+        env:
+          CARGO_NET_RETRY: '10'
+          CARGO_HTTP_TIMEOUT: '120'
+        run: |
+          cargo build --release --locked \
+            -p horizon-official --bin horizon-official \
+            -p horizon-client-lib --bin horizon-ctl \
+            -p horizon-prepare --bin horizon-prepare \
+            -p horizon-server --bin horizon-server
+
+      - name: horizon-official 就是玩家拿到的 horizon-client
+        run: cp -f target/release/horizon-official target/release/horizon-client
+
+      - name: 构建 mod 共用的 wasm 标准库
+        run: |
+          mkdir -p wasm-std
+          cargo run --locked -p cargo-horizon-mod -- wasm-std wasm-std/horizon-wasm-std.wasm
+          sha256sum wasm-std/horizon-wasm-std.wasm
+
+      - name: 归集产物
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for f in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            cp -f "target/release/$f" dist/
+          done
+          cp -f wasm-std/horizon-wasm-std.wasm dist/
+          file dist/* || true
+          for f in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            echo "== ldd $f =="; ldd "dist/$f" || true
+          done
+          du -sh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-linux-aarch64-official
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
