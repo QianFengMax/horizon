@@ -141,7 +141,7 @@ pub use native_data_maps::DataMapType;
 pub use native_hooks::{PhantomSpawnResult, Shake, SleepProblem};
 pub use native_mob_draw::{MobRender, PlayerRender};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
@@ -897,6 +897,19 @@ struct TickScratch {
     later: Vec<BlockPos>,
 }
 
+#[derive(Clone, Copy)]
+enum LoadingOverlayPreview {
+    Queued(Duration),
+    Showing { start: Instant, duration: Duration },
+    Closing,
+}
+
+#[derive(Default)]
+struct LoadingOverlayPreviewInput {
+    keys: HashSet<KeyCode>,
+    buttons: HashSet<MouseButton>,
+}
+
 struct Game<'a> {
     /// Shared with an integrated server; `collision` and `motion` borrow from it.
     res: Arc<Resources>,
@@ -918,6 +931,8 @@ struct Game<'a> {
     /// A pack reload staged on a worker (`LoadingOverlay`): the frame draws
     /// its progress until `drive_pack_reload` applies it.
     pack_reload: Option<packs::PackReload>,
+    loading_overlay_preview: Cell<Option<LoadingOverlayPreview>>,
+    loading_overlay_preview_input: LoadingOverlayPreviewInput,
     /// A server's resource packs (game/world/server_packs.rs).
     server_packs: server_packs::ServerPackState,
     /// The link a chat click asks to open (`ConfirmLinkScreen`).
@@ -1557,6 +1572,9 @@ struct Game<'a> {
     dragon_model: Option<horizon_client::mobs::Part>,
     /// Map textures waiting for the next HUD batch to upload them.
     map_patches: Vec<horizon_client::font::Patch>,
+    /// Client mods' dynamic textures (`native_dynamic_textures`): their places in the GUI atlas's
+    /// page and their last pixels, kept through resource reloads.
+    dynamic_textures: horizon_client::hud::dynamic_textures::DynamicTextures,
     name_tag_layouts: names::NameTagLayouts,
     text_displays: std::collections::HashMap<i32, text_displays::RemoteTextDisplay>,
     interactions: std::collections::HashMap<i32, interactions::RemoteInteraction>,
@@ -7396,8 +7414,9 @@ impl Game<'_> {
     }
     /// `Player.getVehicle().getBoundingBox()` for the local player's vehicle
     /// (`riding`): a mob, one of `object_target`'s kinds (boat, cart, armour
-    /// stand, item frame, painting) or a tracked special — the same chain
-    /// `guest_target_box` resolves a guest's vehicle through.
+    /// stand, item frame, painting, the level's own `minecraft:interaction`) or a
+    /// tracked special — the same chain `guest_target_box` resolves a guest's
+    /// vehicle through.
     fn riding_box(&self) -> Option<Aabb> {
         let id = self.riding?;
         if let Some(m) = self.mobs.iter().find(|m| m.id == id) {
@@ -7534,8 +7553,8 @@ impl Game<'_> {
         }
     }
     /// ServerPlayer.startSleepInBed: in reach, not obstructed, night or thunder,
-    /// and (outside creative) no monsters within 8 blocks; the bed becomes the
-    /// respawn point either way.
+    /// and (outside creative) no monsters within 8 blocks of the head; the bed
+    /// becomes the respawn point either way.
     fn try_sleep(&mut self, pos: [i32; 3]) {
         if self.fake_blocks(mod_api::FakeEffect::Sleep) {
             return;
@@ -7599,8 +7618,10 @@ impl Game<'_> {
         // RespawnConfig(the head, the player's yaw), not forced). It replaces
         // an anchor or a spawnpoint; respawning checks the bed is still there
         // and finds where to stand up (findRespawnAndUseSpawnBlock).
-        // Straw beds never set it (`straw_bed_rule`).
-        if problem.is_none() && self.bed_sets_spawn(state) {
+        // Straw beds never set it (`straw_bed_rule`). `canSetSpawn` is read once,
+        // up front, and also gates the `slept_in_bed` trigger below.
+        let can_set_spawn = self.bed_sets_spawn(state);
+        if problem.is_none() && can_set_spawn {
             let config = respawn_anchor::RespawnConfig::wrapped(self.dim, head, yaw, false);
             // ServerPlayer.setRespawnPosition: the chat message only when the
             // point moved (`isSamePosition`).
@@ -7632,19 +7653,22 @@ impl Game<'_> {
         if problem.is_none() && !self.bed_can_sleep_now() {
             problem = Some("not_possible_now");
         }
+        let universal_anger = self
+            .ui
+            .rules
+            .bool_at(horizon_client::gamerules::vanilla::UNIVERSAL_ANGER);
         // Creative players skip the monster check (`!this.isCreative()`).
         if problem.is_none()
             && !self.creative
             && self.mobs.iter().any(|m| {
                 // `Monster.class` entities that `isPreventingPlayerRest`: a
-                // zombified piglin only while it is angry.
+                // zombified piglin only while it is angry at the sleeper
+                // (`ZombifiedPiglin.isPreventingPlayerRest`: `isAngryAt`).
                 horizon_client::mobs::ai::is_monster(m.species())
                     && (m.species() != horizon_client::mobs::Species::ZombifiedPiglin
-                        || (m.extra.anger > 0 && m.ai.target.is_some()))
+                        || horizon_client::mobs::neutral_anger::angry_at_player(m, universal_anger))
                     && m.alive()
-                    && (m.position.x - position.x).abs() < 8.0
-                    && (m.position.y - position.y).abs() < 5.0
-                    && (m.position.z - position.z).abs() < 8.0
+                    && beds::near_bed(head, m.bounds())
             })
         {
             problem = Some("not_safe");
@@ -7705,7 +7729,11 @@ impl Game<'_> {
         if self.lie_in_bed(head) {
             let bed = self.world.block(head[0], head[1], head[2]);
             self.award_custom_stat(self.slept_in_bed_stat(bed), 1);
-            self.trigger_player("minecraft:slept_in_bed");
+            // ServerPlayer.startSleepInBed: the trigger only where the bed rule
+            // can set the respawn point, so not in a straw bed.
+            if can_set_spawn {
+                self.trigger_player("minecraft:slept_in_bed");
+            }
             self.stats.reset("custom", "minecraft:time_since_rest");
         }
     }
@@ -8108,6 +8136,98 @@ impl Game<'_> {
         );
         self.world.modified = modified;
     }
+    fn preview_loading_overlay(&self, desired_ms: u32) -> bool {
+        if desired_ms == 0
+            || !self.options.is_client_start()
+            || self.options.headless
+            || self.loading_overlay_preview_active()
+            || self.loading_overlay_preview_interrupted()
+        {
+            return false;
+        }
+        // Client setup can request this before any frame. Start the clock when it is drawn.
+        self.loading_overlay_preview
+            .set(Some(LoadingOverlayPreview::Queued(Duration::from_millis(
+                u64::from(desired_ms),
+            ))));
+        true
+    }
+
+    fn loading_overlay_preview_interrupted(&self) -> bool {
+        self.pack_reload.is_some()
+            || self.pending_pack_reload
+            || self.integrated_starting.is_some()
+            || self.pending_entry.is_some()
+            || self.remote_screen_up()
+            || self.pending_save.is_some()
+            || self.error.is_some()
+            || self.client_quit.get() != ClientQuit::Running
+            || self.scripted_run()
+    }
+
+    fn loading_overlay_preview_active(&self) -> bool {
+        if self.loading_overlay_preview.get().is_none() {
+            return false;
+        }
+        // A real load takes over permanently, rather than pausing a stale preview.
+        if self.loading_overlay_preview_interrupted() {
+            self.loading_overlay_preview.set(None);
+            return false;
+        }
+        true
+    }
+
+    fn prepare_loading_overlay_preview_input(&mut self) {
+        if !matches!(
+            self.loading_overlay_preview.get(),
+            Some(LoadingOverlayPreview::Queued(_))
+        ) {
+            return;
+        }
+        let input = &mut self.loading_overlay_preview_input;
+        input.keys.extend(self.physical_keys.drain());
+        input.buttons.extend(self.physical_buttons.drain());
+        self.keys.clear();
+        self.native_input.mappings.release_all();
+        self.debug_keys.reset();
+        self.left = false;
+        self.right = false;
+        self.drag_button = None;
+        self.dragging = false;
+        self.inv_clicks.cancel_drag();
+        self.mouse = Default::default();
+    }
+
+    fn dismiss_loading_overlay_preview(&self) {
+        // Do not let the dismissal or a second input reach the screen before it is shown again.
+        self.loading_overlay_preview
+            .set(Some(LoadingOverlayPreview::Closing));
+    }
+
+    fn loading_overlay_preview_frame(&self) -> Option<(f32, LoadingOverlayPreview)> {
+        match self.loading_overlay_preview.get()? {
+            LoadingOverlayPreview::Queued(duration) => Some((
+                0.0,
+                LoadingOverlayPreview::Showing {
+                    start: Instant::now(),
+                    duration,
+                },
+            )),
+            showing @ LoadingOverlayPreview::Showing { start, duration } => {
+                let elapsed = start.elapsed();
+                if elapsed >= duration {
+                    Some((1.0, LoadingOverlayPreview::Closing))
+                } else {
+                    Some((
+                        (elapsed.as_secs_f64() / duration.as_secs_f64()) as f32,
+                        showing,
+                    ))
+                }
+            }
+            LoadingOverlayPreview::Closing => None,
+        }
+    }
+
     fn render(&mut self) -> Result<bool> {
         if self.screenshot_sequence.is_some() {
             return self.render_sequence_frame();
@@ -8175,6 +8295,9 @@ impl Game<'_> {
         // `Gui.setScreen` clears the focus of the screen it leaves: a menu
         // that comes back starts with no widget highlighted.
         self.drop_left_screen_focus();
+        if self.loading_overlay_preview_active() {
+            self.prepare_loading_overlay_preview_input();
+        }
         // Minecraft.doWorldLoad: the LevelLoadingScreen while single player's
         // server starts, with the server's chunk map and progress.
         if let Some(starting) = &self.integrated_starting {
@@ -8278,16 +8401,17 @@ impl Game<'_> {
                     [renderer.config.width, renderer.config.height],
                     self.settings.gui_scale_inputs(),
                 );
-                horizon_client::level_loading::draw_loading_overlay(
+                Self::draw_native_loading_overlay(
                     &mut hud,
                     &self.gui.atlas,
                     reload.progress.line(),
                     reload.progress.fraction(),
                     self.settings.file.bool("darkMojangStudiosBackground"),
+                    mod_api::LoadingOverlayPhase::Reload,
                 );
                 pr.lap("pr_loading");
                 drop(prepare);
-                return renderer.render(&loading_frame(&hud));
+                return consume(renderer, &loading_frame(&hud));
             }
             return Ok(false);
         }
@@ -8298,6 +8422,25 @@ impl Game<'_> {
         else {
             return Ok(false);
         };
+        if let Some((progress, next)) = self.loading_overlay_preview_frame() {
+            let mut hud = HudBatch::new(size, self.settings.gui_scale_inputs());
+            Self::draw_native_loading_overlay(
+                &mut hud,
+                &self.gui.atlas,
+                "",
+                progress,
+                self.settings.file.bool("darkMojangStudiosBackground"),
+                mod_api::LoadingOverlayPhase::Preview,
+            );
+            pr.lap("pr_loading");
+            drop(prepare);
+            let result = consume(self.renderer.as_mut().unwrap(), &loading_frame(&hud));
+            self.frame_drawn = matches!(result, Ok(true));
+            if self.frame_drawn {
+                self.loading_overlay_preview.set(Some(next));
+            }
+            return result;
+        }
         pr.lap("pr_setup");
         if mod_api::__private::listened(mod_api::HookId::RenderFrame)
             && self.title.is_none()
@@ -8902,6 +9045,9 @@ impl Game<'_> {
         // geometry (game/blocks/maps/mod.rs, world text) upload with this batch; draining
         // map_patches any earlier leaves them a frame behind.
         hud.patches.append(&mut self.map_patches);
+        // Client mods' dynamic textures created, updated or lost by a rebuilt atlas texture.
+        self.dynamic_textures
+            .patches(&mut self.gui.atlas, &mut hud.patches);
         hud.patches.append(self.text_patches.get_mut());
         let entity_spans = std::mem::take(self.entity_spans.get_mut());
         let entity_motion = std::mem::take(self.entity_motion.get_mut());
@@ -9085,6 +9231,14 @@ impl Game<'_> {
         let _cleanup = spans::guard("pr_cleanup");
         // A frame the surface refused (occluded, lost, timed out) is `Ok(false)`.
         self.frame_drawn = matches!(result, Ok(true));
+        if self.frame_drawn
+            && matches!(
+                self.loading_overlay_preview.get(),
+                Some(LoadingOverlayPreview::Closing)
+            )
+        {
+            self.loading_overlay_preview.set(None);
+        }
         // Restore storage even when rendering fails (for example, a lost surface).
         self.hud_batch = hud;
         self.entity_vertices = entities;
@@ -9583,6 +9737,12 @@ impl Game<'_> {
                     pressed: *state == ElementState::Pressed,
                 });
             }
+            if let Some(post) = &mouse_post
+                && self.container_mouse_input_pre(post)
+            {
+                mouse_post = None;
+                return Ok(());
+            }
             self.key_focus_mouse_press(&event);
             match event {
                 WindowEvent::CloseRequested => {
@@ -9661,7 +9821,12 @@ impl Game<'_> {
                         }
                         match self.screen_mouse_dragged(previous) {
                             native_hooks::ScreenMousePre::Canceled => return Ok(()),
-                            native_hooks::ScreenMousePre::Passed(post) => mouse_post = Some(post),
+                            native_hooks::ScreenMousePre::Passed(post) => {
+                                if self.container_mouse_input_pre(&post) {
+                                    return Ok(());
+                                }
+                                mouse_post = Some(post);
+                            }
                             native_hooks::ScreenMousePre::NotFired => {}
                         }
                         if self.dialog_open() {
@@ -9748,6 +9913,12 @@ impl Game<'_> {
                             scaled(raw_x),
                             scaled(raw_y),
                         ]));
+                    }
+                    if let Some(post) = &mouse_post
+                        && self.container_mouse_input_pre(post)
+                    {
+                        mouse_post = None;
+                        return Ok(());
                     }
                     // A prompt is vanilla's `Minecraft.screen`, the only one MouseHandler.onScroll
                     // tells: the top one hears the wheel, as the click arms below pick it, and
@@ -10895,6 +11066,8 @@ impl<'a> Game<'a> {
             frame_attempted: render_settings::FrameAttempt::default(),
             pack_folder: None,
             pack_reload: None,
+            loading_overlay_preview: Cell::new(None),
+            loading_overlay_preview_input: LoadingOverlayPreviewInput::default(),
             server_packs: Default::default(),
             link_prompt: None,
             command_prompt: None,
@@ -11248,6 +11421,7 @@ impl<'a> Game<'a> {
             breath_clouds: Default::default(),
             dragon_model: prepared.dragon_model,
             map_patches: Vec::new(),
+            dynamic_textures: Default::default(),
             name_tag_layouts: Default::default(),
             text_displays: Default::default(),
             interactions: Default::default(),

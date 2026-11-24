@@ -143,6 +143,13 @@ impl RayWorld for VisualRays<'_, '_> {
 fn own_invisible(effects: &horizon_client::effects::PlayerEffects, shared_flag: bool) -> bool {
     shared_flag || effects.get("invisibility").is_some()
 }
+/// `Entity.isCurrentlyGlowing` for the window's player: shared flag 6 as its server
+/// sets it (`shared_flag`), from the Glowing effect or the `Glowing` tag a command or
+/// a plugin's `setGlowing` gives, which no effect shows (#18838); a world in the frame
+/// has only the effect.
+fn own_glowing(effects: &horizon_client::effects::PlayerEffects, shared_flag: bool) -> bool {
+    shared_flag || effects.get("glowing").is_some()
+}
 /// `LivingEntityRenderer.isBodyVisible` and `isInvisibleTo` for the player's
 /// own body, seen by itself: an invisible player (`own_invisible`) hides it
 /// unless its team sees friendly invisibles, where vanilla draws it
@@ -790,6 +797,13 @@ impl Game<'_> {
             self.remote.as_ref().is_some_and(|r| r.own_invisible),
         )
     }
+    /// `Entity.isCurrentlyGlowing` for the player itself (`own_glowing`).
+    fn own_glowing(&self) -> bool {
+        own_glowing(
+            &self.potions.effects,
+            self.remote.as_ref().is_some_and(|r| r.own_glowing),
+        )
+    }
     /// Whether the player's own body is drawn (`body_visible`).
     pub(super) fn own_body_visible(&self) -> bool {
         body_visible(self.own_invisible(), self.own_team())
@@ -850,6 +864,9 @@ impl Game<'_> {
         let Some(hidden) = pre else {
             return;
         };
+        // What it wears and holds as a mod's `render_worn_equipment` lets it be drawn: its
+        // armour, wings, held and head items read it; the screens' previews don't.
+        let _equipment = self.mod_render_equipment(m, true, alpha as f32);
         // The mods' layers' posed parts, kept from the draw below while they want them.
         let mut parts = None;
         let layers = if shows(Layer::CustomLayers) {
@@ -953,12 +970,10 @@ impl Game<'_> {
         }
         // The post hooks, whether or not the layers drew (a spectator draws none).
         self.mod_render_post(m, Some(who), parts, alpha as f32, camera, packed, out);
-        // LivingEntity.isCurrentlyGlowing: the Glowing effect.
+        // Entity.isCurrentlyGlowing on a client: shared flag 6 (`own_glowing`).
         let vanilla = self
-            .potions
-            .effects
-            .get("glowing")
-            .map(|_| super::glowing::team_color(self.own_team()));
+            .own_glowing()
+            .then(|| super::glowing::team_color(self.own_team()));
         let id = u32::try_from(self.own_entity_id()).unwrap_or(0);
         if let Some(color) = self.entity_outline(id, "minecraft:player", vanilla) {
             // LivingEntityRenderer.getRenderType: an invisible glowing body
@@ -1141,6 +1156,21 @@ impl Game<'_> {
             .extra
             .slot_stack(horizon_items::equipment::CHEST)
             .filter(|s| chest == Some(&*s.item));
+        // As a mod's `render_worn_equipment` lets the wings be drawn.
+        let shown = horizon_client::mobs::render::shown_equipment();
+        let (wings, glint) = (
+            mod_api::EquipmentRenderSlot::Elytra,
+            mod_api::EquipmentRenderPart::Glint,
+        );
+        if shown.hides(wings, mod_api::EquipmentRenderPart::Base) {
+            return;
+        }
+        let overlay = if shown.hides(wings, glint) {
+            0
+        } else {
+            self.wings_overlay(stack)
+        };
+        let start = out.len();
         self.wings_geometry(
             chest,
             stack,
@@ -1150,9 +1180,10 @@ impl Game<'_> {
             m.extra.elytra.angles(partial),
             m.extra.crouching,
             light,
-            self.wings_overlay(stack),
+            overlay,
             out,
         );
+        horizon_client::mobs::render::tint_vertices(&mut out[start..], shown.tint_color(wings));
     }
     /// `WingsLayer` draws through `EquipmentLayerRenderer.renderLayers`: the
     /// armour glint when the worn elytra `hasFoil()`.
@@ -2069,6 +2100,21 @@ mod preview_tests {
         let mut board = horizon_client::scoreboard::Scoreboard::default();
         let team = board.add_team("blue");
         assert!(body_visible(own_invisible(&effects, true), Some(team)));
+    }
+
+    /// #18838: `/data merge entity @s {Glowing:1b}` or a plugin's `setGlowing(true)` sets
+    /// only the server's shared flag 6, which outlines the own body as the effect does.
+    #[test]
+    fn the_servers_glowing_flag_outlines_the_own_body_without_the_effect() {
+        use horizon_client::effects::EffectInstance;
+        let mut effects = horizon_client::effects::PlayerEffects::default();
+        assert!(!own_glowing(&effects, false));
+        assert!(own_glowing(&effects, true));
+        let id = horizon_client::brewing::effect("minecraft:glowing")
+            .unwrap()
+            .id;
+        effects.add(EffectInstance::new(id, 3600, 0));
+        assert!(own_glowing(&effects, false));
     }
 
     /// LivingEntityRenderer.submit: an invisible body is not drawn, its
