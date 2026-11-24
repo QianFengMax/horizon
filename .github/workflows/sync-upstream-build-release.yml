@@ -95,17 +95,34 @@ jobs:
             echo "merged=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          before="$(git rev-parse HEAD)"
           echo "上游有新提交：$(git rev-list --count HEAD..upstream/main) 个，开始合并"
-          if git merge --no-ff --no-edit upstream/main \
-               -m "chore: sync upstream $(git rev-parse --short=8 upstream/main) [skip ci]"; then
-            echo "merged=true" >> "$GITHUB_OUTPUT"
-          else
+          if ! git merge --no-ff --no-edit upstream/main \
+                 -m "chore: sync upstream $(git rev-parse --short=8 upstream/main) [skip ci]"; then
             echo "::error::合并上游冲突，冲突文件："
             git diff --name-only --diff-filter=U | sed 's/^/  /'
             git merge --abort
             echo "::error::请在本地解决后重跑；若只想跟随上游，可手动 Dispatch 并勾选 reset_to_upstream。"
             exit 1
           fi
+          after="$(git rev-parse HEAD)"
+          # GITHUB_TOKEN 没有 workflows 权限，推不动 workflow 文件的改动。我们有自己的
+          # ARM64 构建和同步 workflow，上游那些 CI 定义不需要，还原到合并前的样子。
+          if git diff --quiet "$before" "$after" -- .github/workflows/ 2>/dev/null; then
+            echo "上游未改动 workflow 文件"
+          else
+            echo "还原上游对 .github/workflows/ 的改动（GITHUB_TOKEN 无 workflows 权限）"
+            git checkout "$before" -- .github/workflows/
+            # checkout 只还原修改/删除，上游新加的文件得单独删掉，否则推送仍被 workflows 权限拦
+            git diff --name-only --diff-filter=A "$before" "$after" -- .github/workflows/ \
+              | while read -r f; do
+                  [ -n "$f" ] && git rm -f --quiet "$f" && echo "  删掉上游新增: $f"
+                done
+            if ! git diff --cached --quiet; then
+              git commit --amend --no-edit
+            fi
+          fi
+          echo "merged=true" >> "$GITHUB_OUTPUT"
 
       - name: 推送
         if: steps.merge.outputs.merged == 'true'
