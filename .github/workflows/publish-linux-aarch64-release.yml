@@ -1,0 +1,41 @@
+name: publish-linux-aarch64-release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: 下载已构建产物（runner 内网）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download 45316405937 -R "$GITHUB_REPOSITORY" \
+            -n horizon-linux-aarch64-official -D dist
+          ls -lh dist
+
+      - name: 打包并校验
+        run: |
+          set -euo pipefail
+          tar -czf horizon-linux-aarch64-official.tar.gz -C dist .
+          sha256sum horizon-linux-aarch64-official.tar.gz > SHA256SUMS
+          tar -tzf horizon-linux-aarch64-official.tar.gz
+          cat SHA256SUMS
+
+      - name: 创建 Release 并上传资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create linux-aarch64-local \
+            --title "Horizon Linux aarch64 本地构建产物" \
+            --notes "GitHub Actions ubuntu-24.04-arm 构建，源 run 45316405937；供镜像站下载。" \
+            horizon-linux-aarch64-official.tar.gz SHA256SUMS \
+            || gh release upload linux-aarch64-local \
+                 horizon-linux-aarch64-official.tar.gz SHA256SUMS --clobber
