@@ -6,8 +6,6 @@ on:
       server:
         description: "1 = 只构建专用服务端版本"
         default: "0"
-  push:
-    branches: [main]
 
 permissions:
   contents: read
